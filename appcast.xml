@@ -1,0 +1,22 @@
+<?xml version="1.0" standalone="yes"?>
+<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
+    <channel>
+        <title>Pastel</title>
+        <item>
+            <title>26.5.1</title>
+            <pubDate>Sun, 14 Jun 2026 20:58:16 +0800</pubDate>
+            <link>https://github.com/EEliberto/IPA-Download</link>
+            <sparkle:version>2</sparkle:version>
+            <sparkle:shortVersionString>26.5.1</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description sparkle:format="markdown"><![CDATA[## Pastel 26.5.1
+
+- Added Sparkle update checking.
+- Apple account passwords are now stored in macOS Keychain.
+- Local credential metadata no longer stores passwords or encryption keys.
+]]></description>
+            <enclosure url="https://github.com/EEliberto/IPA-Download/releases/download/Pastel2/Pastel-26.5.1-build-2.dmg" length="37795257" type="application/octet-stream" sparkle:edSignature="DvrecF9UDx8HhZHdyEG1uoohhmtHMFrYGRNpYOn4n5Hq3vkEY6m7qyJDWT5l/82itiyusRt9+z6qL/pvhwALDQ=="/>
+        </item>
+    </channel>
+</rss>

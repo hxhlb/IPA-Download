@@ -1,6 +1,8 @@
 import AppKit
+import Combine
 import CryptoKit
 import Security
+import Sparkle
 import SwiftUI
 
 private let appDisplayName = "Pastel"
@@ -40,48 +42,202 @@ private struct LegacyStoredCredentials: Codable {
 }
 
 enum CredentialVaultError: LocalizedError {
-    case unexpectedKeychainStatus(OSStatus)
-    case invalidKeyData
-    case invalidEncryptedFile
-    case encryptionFailed
+    case keychainOperationFailed(String, OSStatus)
+    case invalidLegacyKeyData
 
     var errorDescription: String? {
         switch self {
-        case .unexpectedKeychainStatus(let status):
-            return String(localized: "凭据密钥 (Keychain) 读取失败：\(Int(status))")
-        case .invalidKeyData:
-            return String(localized: "凭据密钥 (Keychain) 无效")
-        case .invalidEncryptedFile:
-            return String(localized: "本地加密凭据文件无效")
-        case .encryptionFailed:
-            return String(localized: "凭据加密失败")
+        case .keychainOperationFailed(let operation, let status):
+            return String(localized: "Keychain \(operation) 失败：\(Int(status))")
+        case .invalidLegacyKeyData:
+            return String(localized: "旧版凭据密钥无效")
         }
     }
 }
 
-enum CredentialVault {
-    private static var cachedKeyData: Data?
+private struct StoredAccountMetadata: Codable {
+    var id: UUID
+    var label: String
+    var countryCode: String
+    var appleAccount: String
+}
 
-    static func save(_ credentials: StoredCredentials) throws {
-        try prepareDirectory()
-        let keyData = try loadOrCreateKeyData()
-        let key = SymmetricKey(data: keyData)
-        let payload = try JSONEncoder().encode(credentials)
-        let sealedBox = try AES.GCM.seal(payload, using: key)
-        guard let combined = sealedBox.combined else {
-            throw CredentialVaultError.encryptionFailed
+private struct StoredCredentialsMetadata: Codable {
+    var selectedAccountID: UUID?
+    var accounts: [StoredAccountMetadata]
+
+    init(_ credentials: StoredCredentials) {
+        selectedAccountID = credentials.selectedAccountID
+        accounts = credentials.accounts.map {
+            StoredAccountMetadata(id: $0.id,
+                                  label: $0.label,
+                                  countryCode: $0.countryCode,
+                                  appleAccount: $0.appleAccount)
+        }
+    }
+}
+
+private enum KeychainPasswordStore {
+    private static let service = "com.allenmiao.ipahistorydownload.apple-account-password"
+
+    static func savePassword(_ password: String, for account: StoredAccount) throws {
+        let passwordData = Data(password.utf8)
+        let query = baseQuery(for: account.id)
+        let update: [String: Any] = [
+            kSecValueData as String: passwordData,
+            kSecAttrLabel as String: account.displayLabel,
+            kSecAttrDescription as String: "Pastel Apple account password"
+        ]
+
+        let updateStatus = SecItemUpdate(query as CFDictionary, update as CFDictionary)
+        if updateStatus == errSecSuccess {
+            return
         }
 
-        try combined.write(to: credentialsURL, options: [.atomic])
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: credentialsURL.path)
+        guard updateStatus == errSecItemNotFound else {
+            throw CredentialVaultError.keychainOperationFailed("更新", updateStatus)
+        }
+
+        var addQuery = query
+        addQuery[kSecValueData as String] = passwordData
+        addQuery[kSecAttrLabel as String] = account.displayLabel
+        addQuery[kSecAttrDescription as String] = "Pastel Apple account password"
+        addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+
+        let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
+        guard addStatus == errSecSuccess else {
+            throw CredentialVaultError.keychainOperationFailed("写入", addStatus)
+        }
+    }
+
+    static func loadPassword(for accountID: UUID) throws -> String {
+        var query = baseQuery(for: accountID)
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        if status == errSecItemNotFound {
+            return ""
+        }
+        guard status == errSecSuccess else {
+            throw CredentialVaultError.keychainOperationFailed("读取", status)
+        }
+        guard let data = result as? Data,
+              let password = String(data: data, encoding: .utf8) else {
+            return ""
+        }
+        return password
+    }
+
+    static func deletePassword(for accountID: UUID) throws {
+        let status = SecItemDelete(baseQuery(for: accountID) as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw CredentialVaultError.keychainOperationFailed("删除", status)
+        }
+    }
+
+    static func deleteAllPasswords() throws {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service
+        ]
+        let status = SecItemDelete(query as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw CredentialVaultError.keychainOperationFailed("删除", status)
+        }
+    }
+
+    private static func baseQuery(for accountID: UUID) -> [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: accountID.uuidString
+        ]
+    }
+}
+
+enum CredentialVault {
+    static func save(_ credentials: StoredCredentials) throws {
+        try prepareDirectory()
+
+        let normalized = credentials.normalized
+        for account in normalized.accounts {
+            try KeychainPasswordStore.savePassword(account.password, for: account)
+        }
+
+        let metadata = StoredCredentialsMetadata(normalized)
+        let payload = try JSONEncoder().encode(metadata)
+        try payload.write(to: metadataURL, options: [.atomic])
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: metadataURL.path)
+        try? deleteLegacyEncryptedFiles()
     }
 
     static func load() throws -> StoredCredentials? {
+        if FileManager.default.fileExists(atPath: metadataURL.path) {
+            let data = try Data(contentsOf: metadataURL)
+            let metadata = try JSONDecoder().decode(StoredCredentialsMetadata.self, from: data)
+            let accounts = try metadata.accounts.map { item in
+                StoredAccount(id: item.id,
+                              label: item.label,
+                              countryCode: item.countryCode,
+                              appleAccount: item.appleAccount,
+                              password: try KeychainPasswordStore.loadPassword(for: item.id))
+            }
+            return StoredCredentials(selectedAccountID: metadata.selectedAccountID, accounts: accounts).normalized
+        }
+
+        guard let legacyCredentials = try loadLegacyEncryptedCredentials() else {
+            return nil
+        }
+
+        try save(legacyCredentials)
+        return legacyCredentials.normalized
+    }
+
+    static func deleteStoredCredentials() throws {
+        if FileManager.default.fileExists(atPath: metadataURL.path) {
+            try FileManager.default.removeItem(at: metadataURL)
+        }
+        try KeychainPasswordStore.deleteAllPasswords()
+        try? deleteLegacyEncryptedFiles()
+    }
+
+    static func deletePassword(for accountID: UUID) throws {
+        try KeychainPasswordStore.deletePassword(for: accountID)
+    }
+
+    private static var metadataURL: URL {
+        applicationSupportURL.appendingPathComponent("accounts.json")
+    }
+
+    private static var credentialsURL: URL {
+        applicationSupportURL.appendingPathComponent("credentials.enc")
+    }
+
+    private static var keyURL: URL {
+        applicationSupportURL.appendingPathComponent("credential-key.bin")
+    }
+
+    private static var applicationSupportURL: URL {
+        let baseURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support")
+        return baseURL.appendingPathComponent(appDisplayName, isDirectory: true)
+    }
+
+    private static func prepareDirectory() throws {
+        try FileManager.default.createDirectory(at: applicationSupportURL, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: applicationSupportURL.path)
+    }
+
+    private static func loadLegacyEncryptedCredentials() throws -> StoredCredentials? {
         guard FileManager.default.fileExists(atPath: credentialsURL.path) else {
             return nil
         }
 
-        let keyData = try loadOrCreateKeyData()
+        guard let keyData = try loadLegacyKeyData() else {
+            return nil
+        }
         let key = SymmetricKey(data: keyData)
         let encryptedData = try Data(contentsOf: credentialsURL)
         let sealedBox = try AES.GCM.SealedBox(combined: encryptedData)
@@ -109,60 +265,25 @@ enum CredentialVault {
         }
     }
 
-    static func deleteStoredCredentials() throws {
+    private static func deleteLegacyEncryptedFiles() throws {
         if FileManager.default.fileExists(atPath: credentialsURL.path) {
             try FileManager.default.removeItem(at: credentialsURL)
         }
-    }
-
-    private static var credentialsURL: URL {
-        applicationSupportURL.appendingPathComponent("credentials.enc")
-    }
-
-    private static var keyURL: URL {
-        applicationSupportURL.appendingPathComponent("credential-key.bin")
-    }
-
-    private static var applicationSupportURL: URL {
-        let baseURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support")
-        return baseURL.appendingPathComponent(appDisplayName, isDirectory: true)
-    }
-
-    private static func prepareDirectory() throws {
-        try FileManager.default.createDirectory(at: applicationSupportURL, withIntermediateDirectories: true)
-        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: applicationSupportURL.path)
-    }
-
-    private static func loadOrCreateKeyData() throws -> Data {
-        if let cachedKeyData {
-            return cachedKeyData
-        }
-
-        try prepareDirectory()
-
         if FileManager.default.fileExists(atPath: keyURL.path) {
-            let data = try Data(contentsOf: keyURL)
-            guard data.count == 32 else {
-                throw CredentialVaultError.invalidKeyData
-            }
-            cachedKeyData = data
-            return data
+            try FileManager.default.removeItem(at: keyURL)
+        }
+    }
+
+    private static func loadLegacyKeyData() throws -> Data? {
+        guard FileManager.default.fileExists(atPath: keyURL.path) else {
+            return nil
         }
 
-        var keyData = Data(count: 32)
-        let randomStatus = keyData.withUnsafeMutableBytes { buffer in
-            SecRandomCopyBytes(kSecRandomDefault, 32, buffer.baseAddress!)
+        let data = try Data(contentsOf: keyURL)
+        guard data.count == 32 else {
+            throw CredentialVaultError.invalidLegacyKeyData
         }
-        guard randomStatus == errSecSuccess else {
-            throw CredentialVaultError.unexpectedKeychainStatus(randomStatus)
-        }
-
-        try keyData.write(to: keyURL, options: [.atomic])
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: keyURL.path)
-
-        cachedKeyData = keyData
-        return keyData
+        return data
     }
 }
 
@@ -470,6 +591,7 @@ final class AccountStore: ObservableObject {
 
     func delete(_ account: StoredAccount) {
         let wasSelected = account.id == selectedAccountID
+        try? CredentialVault.deletePassword(for: account.id)
         accounts.removeAll { $0.id == account.id }
         guard !accounts.isEmpty else {
             selectedAccountID = nil
@@ -5608,7 +5730,7 @@ struct AccountSettingsView: View {
                     VStack(alignment: .leading, spacing: 3) {
                         Text(String(localized: "本地凭据保护"))
                             .font(.callout.weight(.semibold))
-                        Text(String(localized: "Apple 账户信息会加密保存在本机，并使用 Keychain 保护加密密钥。"))
+                        Text(String(localized: "Apple 账户密码存储在 macOS Keychain 中，本机只保存账户名称和地区等非敏感设置。"))
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -5996,6 +6118,7 @@ struct LanguageSettingsView: View {
 }
 
 struct AboutSettingsView: View {
+    @EnvironmentObject private var updateManager: AppUpdateManager
     private var appVersion: String {
         Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "26.5.1"
     }
@@ -6049,6 +6172,10 @@ struct AboutSettingsView: View {
 
                 SettingsGroupDivider()
 
+                CheckForUpdatesSettingsRow(updater: updateManager.updater)
+
+                SettingsGroupDivider()
+
                 SettingsLinkRow(title: String(localized: "制作人"),
                                 subtitle: "EEliberto",
                                 url: "https://github.com/EEliberto/IPA-Download")
@@ -6066,6 +6193,10 @@ struct AboutSettingsView: View {
                 SettingsLinkRow(title: "Node.js",
                                 subtitle: String(localized: "内置运行时"),
                                 url: "https://nodejs.org")
+                SettingsGroupDivider()
+                SettingsLinkRow(title: "Sparkle",
+                                subtitle: String(localized: "自动更新框架"),
+                                url: "https://sparkle-project.org")
             }
 
             SettingsGroupBox(String(localized: "第三方依赖")) {
@@ -6121,8 +6252,101 @@ private struct SettingsLinkRow: View {
     }
 }
 
+private struct SettingsActionRow: View {
+    let title: String
+    let subtitle: String
+    let systemImage: String
+    var isEnabled = true
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(title)
+                        .foregroundStyle(.primary)
+                    Text(subtitle)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+
+                Image(systemName: systemImage)
+                    .foregroundStyle(.tertiary)
+            }
+            .contentShape(Rectangle())
+            .padding(.horizontal, 18)
+            .padding(.vertical, 10)
+        }
+        .buttonStyle(.plain)
+        .disabled(!isEnabled)
+    }
+}
+
+final class AppUpdateManager: ObservableObject {
+    let updaterController: SPUStandardUpdaterController
+
+    init() {
+        updaterController = SPUStandardUpdaterController(startingUpdater: true,
+                                                         updaterDelegate: nil,
+                                                         userDriverDelegate: nil)
+    }
+
+    var updater: SPUUpdater {
+        updaterController.updater
+    }
+}
+
+final class CheckForUpdatesViewModel: ObservableObject {
+    @Published var canCheckForUpdates = false
+
+    init(updater: SPUUpdater) {
+        updater.publisher(for: \.canCheckForUpdates)
+            .receive(on: RunLoop.main)
+            .assign(to: &$canCheckForUpdates)
+    }
+}
+
+private struct CheckForUpdatesMenuItem: View {
+    @ObservedObject private var viewModel: CheckForUpdatesViewModel
+    private let updater: SPUUpdater
+
+    init(updater: SPUUpdater) {
+        self.updater = updater
+        viewModel = CheckForUpdatesViewModel(updater: updater)
+    }
+
+    var body: some View {
+        Button(String(localized: "检查更新…")) {
+            updater.checkForUpdates()
+        }
+        .disabled(!viewModel.canCheckForUpdates)
+    }
+}
+
+private struct CheckForUpdatesSettingsRow: View {
+    @ObservedObject private var viewModel: CheckForUpdatesViewModel
+    private let updater: SPUUpdater
+
+    init(updater: SPUUpdater) {
+        self.updater = updater
+        viewModel = CheckForUpdatesViewModel(updater: updater)
+    }
+
+    var body: some View {
+        SettingsActionRow(title: String(localized: "检查更新"),
+                          subtitle: String(localized: "从 GitHub 检查 Pastel 新版本。"),
+                          systemImage: "arrow.clockwise",
+                          isEnabled: viewModel.canCheckForUpdates) {
+            updater.checkForUpdates()
+        }
+    }
+}
+
 struct PastelSettingsCommands: Commands {
     @Environment(\.openWindow) private var openWindow
+    let updateManager: AppUpdateManager
 
     var body: some Commands {
         CommandGroup(replacing: .appSettings) {
@@ -6131,29 +6355,36 @@ struct PastelSettingsCommands: Commands {
             }
             .keyboardShortcut(",", modifiers: .command)
         }
+
+        CommandGroup(after: .appInfo) {
+            CheckForUpdatesMenuItem(updater: updateManager.updater)
+        }
     }
 }
 
 @main
 struct PastelApp: App {
     @StateObject private var accountStore = AccountStore()
+    @StateObject private var updateManager = AppUpdateManager()
 
     var body: some Scene {
         Window(appDisplayName, id: "main") {
             ContentView()
                 .environmentObject(accountStore)
+                .environmentObject(updateManager)
         }
         .windowStyle(.hiddenTitleBar)
         .windowBackgroundDragBehavior(.disabled)
         .windowResizability(.contentMinSize)
         .defaultSize(width: 1240, height: 820)
         .commands {
-            PastelSettingsCommands()
+            PastelSettingsCommands(updateManager: updateManager)
         }
 
         Window(String(localized: "设置"), id: "settings") {
             SettingsRootView()
                 .environmentObject(accountStore)
+                .environmentObject(updateManager)
                 .frame(minWidth: 860, minHeight: 560)
         }
         .windowStyle(.hiddenTitleBar)
