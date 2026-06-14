@@ -5,7 +5,7 @@
 
 使用 SwiftUI 编译，完美适配 macOS 26 的 Liquid Glass 效果。
 
-# 如果你觉得使用 Pastel 感到开心，可以请我喝杯咖啡，谢谢！
+# 如果你觉得使用 Pastel 感到开心，可以请我喝杯咖啡 ☕️。
 <img width="454" height="322" alt="image" src="https://github.com/user-attachments/assets/8b773cd2-2d4e-42b8-bcf4-d2bcf08e593c" />
 
 # 主页面。
@@ -37,7 +37,7 @@
 
 <img width="460" height="90" alt="image" src="https://github.com/user-attachments/assets/4de67361-8727-4705-8718-f9be81bc7b01" />
 
-# 鸣谢
+# 鸣谢。
 本项目参考了来自 ipatools 的部份代码和原理 https://github.com/beer-psi/ipatool.ts。
 
 登陆流程依赖 SideStore 的 GSA。
