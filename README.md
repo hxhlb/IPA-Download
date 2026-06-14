@@ -38,7 +38,7 @@
 <img width="460" height="90" alt="image" src="https://github.com/user-attachments/assets/4de67361-8727-4705-8718-f9be81bc7b01" />
 
 # 鸣谢。
-本项目参考了来自 ipatools 的部份代码和原理 https://github.com/beer-psi/ipatool.ts。
+本项目参考了来自 ipatools 的部份代码和原理 https://github.com/beer-psi/ipatool.ts
 
 登陆流程依赖 SideStore 的 GSA。
 
