@@ -4,13 +4,14 @@ import {createHash} from 'crypto';
 import path from 'path';
 import {Store} from './client.js';
 import {appPriceInfo} from './catalog.js';
-import {restoreCookieJar} from './gsa.js';
+import {readCookieJar, restoreCookieJar} from './gsa.js';
 import {SignatureClient} from './Signature.js';
 import {download} from './downloader.js';
 import {t} from './i18n.js';
 
-const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
-const SESSION_FLOW_VERSION = 'gsa-srp-v10';
+const SESSION_TTL_MS = Number(process.env.IPA_SESSION_TTL_MS || 365 * 24 * 60 * 60 * 1000);
+const SESSION_FLOW_VERSION = 'appstore-direct-v1';
+const ACCEPTED_SESSION_FLOW_VERSIONS = new Set([SESSION_FLOW_VERSION, 'gsa-srp-v10']);
 
 function appSupportDir() {
     if (process.env.IPA_SESSION_DIR) return process.env.IPA_SESSION_DIR;
@@ -31,9 +32,9 @@ function sessionFileFor(email) {
 
 function validSessionFor(email, session) {
     if (!session || typeof session !== 'object') return false;
-    if (session.flowVersion !== SESSION_FLOW_VERSION) return false;
+    if (!ACCEPTED_SESSION_FLOW_VERSIONS.has(session.flowVersion)) return false;
     if (String(session.appleAccount || '').trim().toLowerCase() !== String(email || '').trim().toLowerCase()) return false;
-    if (!session.savedAt || Date.now() - Number(session.savedAt) > SESSION_TTL_MS) return false;
+    if (SESSION_TTL_MS > 0 && session.savedAt && Date.now() - Number(session.savedAt) > SESSION_TTL_MS) return false;
     const authHeaders = session.user?.authHeaders;
     return Boolean(authHeaders?.['X-Token'] && authHeaders?.['X-Dsid']);
 }
@@ -50,15 +51,19 @@ export class Ipa {
         this.usedCachedSession = false;
     }
 
-    async loadSession() {
+    async loadSessionEntry() {
         try {
             const raw = await fsPromises.readFile(this.sessionFile, 'utf8');
-            const session = JSON.parse(raw);
-            if (!validSessionFor(this.creds.APPLE_ID, session)) return null;
-            return session.user;
+            return JSON.parse(raw);
         } catch {
             return null;
         }
+    }
+
+    async loadSession() {
+        const session = await this.loadSessionEntry();
+        if (!validSessionFor(this.creds.APPLE_ID, session)) return null;
+        return session.user;
     }
 
     async saveSession(user) {
@@ -83,26 +88,41 @@ export class Ipa {
         this.usedCachedSession = false;
     }
 
+    applyUser(user, usedCachedSession) {
+        this.user = user;
+        this.auth = {
+            authHeaders: user.authHeaders,
+            pod: user.pod || '',
+            cookieJar: restoreCookieJar(user.cookieText, this.creds.APPLE_ID),
+        };
+        this.usedCachedSession = usedCachedSession;
+    }
+
     async login({force = false} = {}) {
+        const previousSessionEntry = await this.loadSessionEntry();
+        const previousSession = previousSessionEntry?.user || null;
         if (!force) {
-            const cachedUser = await this.loadSession();
+            const cachedUser = validSessionFor(this.creds.APPLE_ID, previousSessionEntry) ? previousSession : null;
             if (cachedUser) {
                 console.log(t('login_local_session', {id: this.creds.APPLE_ID}));
-                this.user = cachedUser;
-                this.auth = {authHeaders: cachedUser.authHeaders, pod: cachedUser.pod || '', cookieJar: restoreCookieJar(cachedUser.cookieText)};
-                this.usedCachedSession = true;
+                this.applyUser(cachedUser, true);
                 return;
             }
         }
 
-        const user = await Store.login(this.creds.APPLE_ID, this.creds.PASSWORD, this.creds.CODE);
+        const user = await Store.login(this.creds.APPLE_ID, this.creds.PASSWORD, this.creds.CODE, previousSession);
         console.log(t('login_success', {name: `${user.accountInfo.address.firstName} ${user.accountInfo.address.lastName}`}));
-        this.user = user;
-        this.auth = {authHeaders: user.authHeaders, pod: user.pod || '', cookieJar: restoreCookieJar(user.cookieText)};
-        this.usedCachedSession = false;
+        this.applyUser(user, false);
         await this.saveSession(user).catch(error => {
             console.log(t('save_session_failed', {message: error.message}));
         });
+    }
+
+    async persistCurrentSession() {
+        if (!this.user) return;
+        const cookieText = readCookieJar(this.auth.cookieJar);
+        if (cookieText) this.user.cookieText = cookieText;
+        await this.saveSession(this.user);
     }
 
     async info(APPID, appVerId) {
@@ -182,6 +202,7 @@ export class Ipa {
 
             console.log(t('file_archived', {out: this.out}));
         } finally {
+            await this.persistCurrentSession().catch(() => {});
             await fsPromises.rm(this.cache, {recursive: true, force: true}).catch(() => {});
             Store.cleanup?.();
             console.log(t('cleanup_done'));
@@ -195,20 +216,24 @@ export class Ipa {
     // 执行 fn；若失败且疑似本地缓存会话过期，则清会话、强制重新登录（可能触发 2FA）后重试一次。
     async _withReauth(fn) {
         try {
-            return await fn();
+            const result = await fn();
+            await this.persistCurrentSession().catch(() => {});
+            return result;
         } catch (error) {
             const message = error.message || String(error);
             // 用稳定的 error.code 判断商店会话过期（cookie/令牌失效），不依赖文案语言；Apple 英文消息保留兜底。
             const code = error.code;
             const sessionMayBeExpired = this.usedCachedSession
-                && (code === 'APPINFO_FAIL' || code === 'LICENSE_FAIL' || code === 'STORE_FAIL'
-                    || /401|403|token|session|authenticate|authorization|Sign In to the iTunes Store|iTunes Store|License not found/i.test(message));
+                && (code === 'TOKEN_EXPIRED'
+                    || /401|403|Your password has changed\.?|password token is expired|token|session|authenticate|authorization|Sign In to the iTunes Store/i.test(message))
+                && !/License not found|已拥有|already|not found/i.test(message);
             if (!sessionMayBeExpired) throw error;
 
             console.log(t('relogin'));
-            await this.clearSession();
             await this.login({force: true});
-            return await fn();
+            const result = await fn();
+            await this.persistCurrentSession().catch(() => {});
+            return result;
         }
     }
 }

@@ -26,20 +26,6 @@
 
 如果在使用 Pastel 時遇到任何問題，請在 GitHub 提交 Issue。
 
-## 香港繁體
-
-多謝你使用 Pastel！
-
-我們很高興帶來 Pastel 26.5.2。
-
-今次更新內容：
-
-1. 支援下載 App 時選擇「不再更新」。選擇後，此 App 將不能再透過 App Store 更新。
-2. 「下載」頁面支援顯示版本 ID、是否為可檢索更新版本，並改善了部分顯示效果。
-3. 修復了一些已知問題。
-
-如果使用 Pastel 時遇到任何問題，請到 GitHub 提交 Issue。
-
 ## English
 
 Thank you for using Pastel!

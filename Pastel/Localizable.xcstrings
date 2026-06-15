@@ -376,6 +376,7 @@
       }
     },
     "App ID %@" : {
+      "extractionState" : "stale",
       "localizations" : {
         "en" : {
           "stringUnit" : {
@@ -1207,6 +1208,7 @@
       }
     },
     "下载此 ID" : {
+      "extractionState" : "stale",
       "localizations" : {
         "en" : {
           "stringUnit" : {
@@ -3303,6 +3305,9 @@
         }
       }
     },
+    "复制 Device GUID" : {
+
+    },
     "大小" : {
       "localizations" : {
         "en" : {
@@ -3613,6 +3618,7 @@
       }
     },
     "展开" : {
+      "extractionState" : "stale",
       "localizations" : {
         "en" : {
           "stringUnit" : {
@@ -4008,6 +4014,9 @@
           }
         }
       }
+    },
+    "已复制" : {
+
     },
     "已清除本地保存的账户" : {
       "extractionState" : "stale",
@@ -4559,7 +4568,11 @@
         }
       }
     },
+    "手动获取" : {
+
+    },
     "手动输入版本 ID" : {
+      "extractionState" : "stale",
       "localizations" : {
         "en" : {
           "stringUnit" : {
@@ -7481,6 +7494,46 @@
         }
       }
     },
+    "用于 Apple Store Services 登录和下载请求。" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Used for Apple Store Services sign-in and download requests."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Apple Store Services のサインインとダウンロードリクエストに使用します。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Apple Store Services 로그인 및 다운로드 요청에 사용됩니다."
+          }
+        },
+        "th" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ใช้สำหรับการลงชื่อเข้าใช้ Apple Store Services และคำขอดาวน์โหลด"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "用於 Apple Store Services 登入和下載請求。"
+          }
+        },
+        "zh-HK" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "用於 Apple Store Services 登入和下載請求。"
+          }
+        }
+      }
+    },
     "登录" : {
       "extractionState" : "stale",
       "localizations" : {
@@ -7603,6 +7656,7 @@
       }
     },
     "直接下载指定版本。" : {
+      "extractionState" : "stale",
       "localizations" : {
         "en" : {
           "stringUnit" : {
@@ -8174,6 +8228,86 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "設為預設帳戶"
+          }
+        }
+      }
+    },
+    "设备" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Device"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "デバイス"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "기기"
+          }
+        },
+        "th" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "อุปกรณ์"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "裝置"
+          }
+        },
+        "zh-HK" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "裝置"
+          }
+        }
+      }
+    },
+    "设备 GUID" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Device GUID"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "デバイス GUID"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "기기 GUID"
+          }
+        },
+        "th" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GUID อุปกรณ์"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "裝置 GUID"
+          }
+        },
+        "zh-HK" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "裝置 GUID"
           }
         }
       }

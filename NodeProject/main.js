@@ -93,9 +93,9 @@ async function runCommand(command, args) {
             CODE: process.env.APPLE_CODE || '',
         });
 
-        // 校验账户模式：强制全新登录（验证密码 + 一次 2FA），成功后回报账户所属商店地区。
+        // 校验账户模式：优先复用本地会话；没有会话时才登录，避免每次编辑/验证账号都触发新设备登录。
         if (process.env.IPA_VALIDATE_LOGIN) {
-            await app.login({force: true});
+            await app.login();
             const storefront = String(app.user?.authHeaders?.['X-Apple-Store-Front'] || '').split('-')[0];
             const addr = app.user?.accountInfo?.address || {};
             printJSON({ok: true, storefront, firstName: addr.firstName || '', lastName: addr.lastName || ''});

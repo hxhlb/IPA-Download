@@ -1,6 +1,6 @@
-import getMAC from 'getmac';
 import plist from 'plist';
-import {gsaLogin, curlRequest, parsePlistLoose, STORE_USER_AGENT, cleanup} from './gsa.js';
+import {storeLogin, curlRequest, parsePlistLoose, STORE_USER_AGENT, cleanup} from './gsa.js';
+import {getDeviceGuid} from './device.js';
 import {t} from './i18n.js';
 
 class ApiError extends Error {
@@ -15,6 +15,16 @@ class ApiError extends Error {
 
 function podPrefix(pod) {
     return pod ? `p${pod}-` : '';
+}
+
+function tokenExpiredError() {
+    const e = new Error('password token is expired');
+    e.code = 'TOKEN_EXPIRED';
+    return e;
+}
+
+function isPasswordTokenExpiredMessage(message) {
+    return /Your password has changed\.?|password token is expired/i.test(String(message || ''));
 }
 
 const _endpoints = {
@@ -48,7 +58,7 @@ const _endpoints = {
 
 class Store {
     static get guid() {
-        return getMAC().replace(/:/g, '').toUpperCase();
+        return getDeviceGuid();
     }
 
     static cleanup() {
@@ -57,9 +67,9 @@ class Store {
 
     // 经 GSA / SRP / 2FA / PET 换取 StoreServices 令牌。
     // 未提供验证码且账号需要 2FA 时，会向受信任设备推送验证码并抛出「需要双重验证码」。
-    static async login(email, password, mfa) {
+    static async login(email, password, mfa, previousSession = null) {
         try {
-            return await gsaLogin(email, password, mfa, this.guid);
+            return await storeLogin(email, password, mfa, this.guid, previousSession?.cookieText || '', previousSession?.pod || '');
         } catch (error) {
             const msg = error.message || String(error);
             // 2FA 检测用稳定的 error.code（不依赖文案语言）；保留中文 includes 作为兜底。
@@ -113,6 +123,7 @@ class Store {
             throw e;
         }
         if (parsedResp.customerMessage) {
+            if (isPasswordTokenExpiredMessage(parsedResp.customerMessage)) throw tokenExpiredError();
             const e = new Error(t('appinfo_custom', {msg: parsedResp.customerMessage}));
             e.code = 'APPINFO_FAIL';
             throw e;
@@ -143,6 +154,7 @@ class Store {
                 else if (parsedResp.status === 0) message = t('lic_new');
                 return {...parsedResp, _state: 'success', customerMessage: message};
             }
+            if (isPasswordTokenExpiredMessage(parsedResp.customerMessage)) throw tokenExpiredError();
             lastMsg = parsedResp.customerMessage || t('lic_fail_msg');
         }
         const e = new Error(t('license_failed', {msg: lastMsg}));

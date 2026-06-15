@@ -23,6 +23,7 @@ const CURL = '/usr/bin/curl';
 const SCUTIL = '/usr/sbin/scutil';
 const GSA_ENDPOINT = 'https://gsa.apple.com/grandslam/GsService2';
 const STORE_AUTH_URL = 'https://buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/authenticate';
+const DEFAULT_NATIVE_AUTH_URL = 'https://auth.itunes.apple.com/auth/v1/native/fast/';
 // 多个公共 anisette 服务器做兜底（取自 SideStore 官方推荐列表）；单个挂了就换下一个。
 // 可用 ANISETTE_SERVER 环境变量在最前面插入自定义服务器。
 const ANISETTE_SERVERS = [
@@ -102,6 +103,64 @@ export function curlRequest(method, url, {headers = {}, body = null, follow = fa
 function headerValue(rawHeaders, name) {
     const m = rawHeaders.match(new RegExp(`^${name}:\\s*(.+)$`, 'im'));
     return m ? m[1].trim() : '';
+}
+
+function podPrefix(pod) {
+    return pod ? `p${pod}-` : '';
+}
+
+function storeAuthURL(guid, pod = '') {
+    return `https://${podPrefix(pod)}buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/authenticate?guid=${encodeURIComponent(guid)}`;
+}
+
+function nativeAuthURL(endpoint, guid) {
+    const url = new URL(endpoint);
+    url.searchParams.set('guid', guid);
+    return url.toString();
+}
+
+function normalizeAuthEndpoint(raw) {
+    try {
+        const url = new URL(raw);
+        if (url.hostname === 'auth.itunes.apple.com') {
+            let pathname = url.pathname.replace(/\/+$/, '');
+            if (!pathname.endsWith('/fast')) pathname += '/fast';
+            url.pathname = `${pathname}/`;
+        }
+        return url.toString();
+    } catch {
+        return DEFAULT_NATIVE_AUTH_URL;
+    }
+}
+
+function extractPlistText(text) {
+    const start = text.indexOf('<plist');
+    const end = text.indexOf('</plist>');
+    if (start >= 0 && end >= start) return text.slice(start, end + '</plist>'.length);
+    return text;
+}
+
+function fetchNativeAuthEndpoint(guid) {
+    try {
+        const url = new URL('https://init.itunes.apple.com/bag.xml');
+        url.searchParams.set('guid', guid);
+        const {status, body} = curlRequest('GET', url.toString(), {
+            headers: {'User-Agent': STORE_UA, Accept: 'application/xml'},
+            follow: true,
+            timeout: 20,
+        });
+        if (status < 200 || status >= 300) return DEFAULT_NATIVE_AUTH_URL;
+        const parsed = plist.parse(extractPlistText(body.toString('utf8')));
+        const urlBag = parsed?.urlBag || {};
+        const authURL = parsed?.authenticateAccount || urlBag.authenticateAccount;
+        return authURL ? normalizeAuthEndpoint(authURL) : DEFAULT_NATIVE_AUTH_URL;
+    } catch {
+        return DEFAULT_NATIVE_AUTH_URL;
+    }
+}
+
+function podFromHeaders(rawHeaders) {
+    return headerValue(rawHeaders, 'pod') || (rawHeaders.match(/Pod=(\d+)/) || [])[1] || '';
 }
 
 export function parsePlistLoose(buf, context = t('ctx_apple_resp')) {
@@ -296,6 +355,71 @@ function storeAuthenticate(email, pet, ani, adsid, gsToken, guid, jar) {
     return {parsed, storeFront, pod: podFromUrl};
 }
 
+// Asspp / ApplePackage 风格的 StoreServices 登录：稳定 guid + 账号密码 + 既有 cookies。
+// 首次登录需要 2FA；之后复用 cookies 轮换 passwordToken，避免重新创建 GSA/anisette 设备。
+function storePasswordAuthenticate(email, password, code, guid, jar) {
+    const body = plist.build({
+        appleId: email,
+        attempt: code ? '2' : '4',
+        guid,
+        password: `${password}${code || ''}`,
+        rmp: '0',
+        why: 'signIn',
+    });
+    const headers = {
+        'User-Agent': STORE_UA,
+        'Content-Type': 'application/x-apple-plist',
+    };
+
+    let res = null;
+    for (let attempt = 1; attempt <= 4; attempt++) {
+        const endpoint = nativeAuthURL(fetchNativeAuthEndpoint(guid), guid);
+        res = curlRequest('POST', endpoint, {headers, body, follow: true, timeout: 30, jar});
+        if (res.status !== 0) break;
+    }
+
+    const parsed = parsePlistLoose(res?.body || Buffer.alloc(0), t('ctx_store_login_resp'));
+    if (String(parsed.failureType || '') === '' && !code && parsed.customerMessage === 'MZFinance.BadLogin.Configurator_message') {
+        throw needs2faError();
+    }
+    if (String(parsed.failureType || '') === '5005') {
+        throw new Error(t('wrong_code'));
+    }
+    if (!parsed.passwordToken || !parsed.dsPersonId) {
+        throw new Error(parsed.customerMessage || t('store_token_failed'));
+    }
+
+    const storeFront = headerValue(res.headers, 'x-set-apple-store-front');
+    return {parsed, storeFront, pod: podFromHeaders(res.headers)};
+}
+
+function userFromStoreAuth(email, parsed, storeFront, pod, jar) {
+    const dsid = parsed.dsPersonId;
+    const authHeaders = {
+        'X-Dsid': dsid,
+        'iCloud-DSID': dsid,
+        'X-Token': parsed.passwordToken,
+    };
+    if (storeFront) authHeaders['X-Apple-Store-Front'] = storeFront;
+
+    const cookieText = existsSync(jar) ? readFileSync(jar, 'utf8') : '';
+    return {
+        accountInfo: parsed.accountInfo || {appleId: email, address: {firstName: '', lastName: ''}},
+        dsPersonId: dsid,
+        passwordToken: parsed.passwordToken,
+        pod: pod || '',
+        authHeaders,
+        cookieText,
+    };
+}
+
+export async function storeLogin(email, password, code, guid, cookieText = '', pod = '') {
+    const jar = path.join(tmpDir(), `store-cookies-${crypto.createHash('sha256').update(String(email || '')).digest('hex').slice(0, 12)}.txt`);
+    if (cookieText) writeFileSync(jar, cookieText);
+    const {parsed, storeFront, pod: newPod} = storePasswordAuthenticate(email, password, code, guid, jar);
+    return userFromStoreAuth(email, parsed, storeFront, newPod || pod, jar);
+}
+
 // 主入口：返回与旧 Store.login 兼容的 user 对象。
 // code 为空且账号需要 2FA 时，会先向受信任设备推送验证码，并抛出「需要双重验证码」。
 export async function gsaLogin(email, password, code, guid) {
@@ -320,30 +444,22 @@ export async function gsaLogin(email, password, code, guid) {
     const jar = path.join(tmpDir(), 'store-cookies.txt');
     const {parsed, storeFront, pod} = storeAuthenticate(email, pet, ani, spd.adsid, spd.GsIdmsToken, guid, jar);
 
-    const dsid = parsed.dsPersonId;
-    const authHeaders = {
-        'X-Dsid': dsid,
-        'iCloud-DSID': dsid,
-        'X-Token': parsed.passwordToken,
-    };
-    if (storeFront) authHeaders['X-Apple-Store-Front'] = storeFront;
-
-    const cookieText = existsSync(jar) ? readFileSync(jar, 'utf8') : '';
-
-    return {
-        accountInfo: parsed.accountInfo || {appleId: email, address: {firstName: spd.fn || '', lastName: spd.ln || ''}},
-        dsPersonId: dsid,
-        passwordToken: parsed.passwordToken,
-        pod: pod || '',
-        authHeaders,
-        cookieText,
-    };
+    const user = userFromStoreAuth(email, parsed, storeFront, pod, jar);
+    if (!parsed.accountInfo) {
+        user.accountInfo = {appleId: email, address: {firstName: spd.fn || '', lastName: spd.ln || ''}};
+    }
+    return user;
 }
 
 // 把缓存的 cookie 文本写回一个临时 jar 文件，返回路径（供复用会话时使用）。
-export function restoreCookieJar(cookieText) {
+export function restoreCookieJar(cookieText, seed = 'default') {
     if (!cookieText) return null;
-    const jar = path.join(tmpDir(), 'store-cookies.txt');
+    const digest = crypto.createHash('sha256').update(String(seed || 'default')).digest('hex').slice(0, 12);
+    const jar = path.join(tmpDir(), `store-cookies-${digest}.txt`);
     writeFileSync(jar, cookieText);
     return jar;
+}
+
+export function readCookieJar(jar) {
+    return jar && existsSync(jar) ? readFileSync(jar, 'utf8') : '';
 }
