@@ -1,11 +1,153 @@
 import AppKit
 import Combine
 import CryptoKit
+import ObjectiveC
 import Security
 import Sparkle
 import SwiftUI
 
 private let appDisplayName = "Pastel"
+
+private extension Notification.Name {
+    static let pastelSelectAllRows = Notification.Name("PastelSelectAllRows")
+    static let pastelRefreshActivePanel = Notification.Name("PastelRefreshActivePanel")
+}
+
+private enum ApplicationKeyboardShortcutInterceptor {
+    private static var didInstall = false
+
+    static func install() {
+        guard !didInstall else { return }
+        guard
+            let original = class_getInstanceMethod(NSApplication.self, #selector(NSApplication.sendEvent(_:))),
+            let replacement = class_getInstanceMethod(NSApplication.self, #selector(NSApplication.pastel_sendEvent(_:)))
+        else { return }
+
+        method_exchangeImplementations(original, replacement)
+        didInstall = true
+        KeyboardCommandRouter.shared.installMenuItem()
+    }
+}
+
+private final class KeyboardCommandRouter: NSObject, NSMenuItemValidation {
+    static let shared = KeyboardCommandRouter()
+
+    private override init() {}
+
+    func installMenuItem() {
+        DispatchQueue.main.async {
+            self.patchSelectAllMenuItem()
+        }
+    }
+
+    func handle(_ event: NSEvent) -> Bool {
+        guard event.type == .keyDown else { return false }
+        guard isCommandOnly(event, matching: "a") else { return false }
+
+        if shouldPassThroughToTextEditor {
+            return false
+        }
+
+        selectAllRows()
+        return true
+    }
+
+    @objc func selectAll(_ sender: Any?) {
+        if shouldPassThroughToTextEditor,
+           let textView = NSApp.keyWindow?.firstResponder as? NSTextView {
+            textView.selectAll(sender)
+        } else {
+            selectAllRows()
+        }
+    }
+
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        true
+    }
+
+    private var shouldPassThroughToTextEditor: Bool {
+        KeyboardShortcutState.shared.isTextEditing
+            && NSApp.keyWindow?.firstResponder is NSTextView
+    }
+
+    private func selectAllRows() {
+        NotificationCenter.default.post(name: .pastelSelectAllRows, object: nil)
+    }
+
+    private func isCommandOnly(_ event: NSEvent, matching character: String) -> Bool {
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let ignoredModifiers: NSEvent.ModifierFlags = [.capsLock, .numericPad, .function]
+        let extraModifiers = modifiers.subtracting([.command]).subtracting(ignoredModifiers)
+        return modifiers.contains(.command)
+            && extraModifiers.isEmpty
+            && event.charactersIgnoringModifiers?.lowercased() == character
+    }
+
+    private func patchSelectAllMenuItem() {
+        guard let mainMenu = NSApp.mainMenu else { return }
+        if let item = selectAllMenuItem(in: mainMenu) {
+            configureSelectAllMenuItem(item)
+            return
+        }
+
+        guard let editMenu = editMenu(in: mainMenu) else { return }
+        editMenu.addItem(.separator())
+        let item = NSMenuItem(title: String(localized: "全选"),
+                              action: #selector(selectAll(_:)),
+                              keyEquivalent: "a")
+        editMenu.addItem(item)
+        configureSelectAllMenuItem(item)
+    }
+
+    private func configureSelectAllMenuItem(_ item: NSMenuItem) {
+        item.target = self
+        item.action = #selector(selectAll(_:))
+        item.keyEquivalent = "a"
+        item.keyEquivalentModifierMask = [.command]
+        item.isEnabled = true
+    }
+
+    private func selectAllMenuItem(in menu: NSMenu) -> NSMenuItem? {
+        for item in menu.items {
+            if isSelectAllMenuItem(item) {
+                return item
+            }
+
+            if let submenu = item.submenu,
+               let found = selectAllMenuItem(in: submenu) {
+                return found
+            }
+        }
+
+        return nil
+    }
+
+    private func isSelectAllMenuItem(_ item: NSMenuItem) -> Bool {
+        item.action == #selector(NSResponder.selectAll(_:))
+            || (item.keyEquivalent.lowercased() == "a"
+                && item.keyEquivalentModifierMask.intersection(.deviceIndependentFlagsMask).contains(.command))
+    }
+
+    private func editMenu(in mainMenu: NSMenu) -> NSMenu? {
+        mainMenu.items.compactMap(\.submenu).first { menu in
+            menu.items.contains { item in
+                item.action == #selector(NSText.copy(_:))
+                    || (item.keyEquivalent.lowercased() == "c"
+                        && item.keyEquivalentModifierMask.intersection(.deviceIndependentFlagsMask).contains(.command))
+            }
+        }
+    }
+}
+
+private extension NSApplication {
+    @objc func pastel_sendEvent(_ event: NSEvent) {
+        if KeyboardCommandRouter.shared.handle(event) {
+            return
+        }
+
+        pastel_sendEvent(event)
+    }
+}
 
 struct StoredCredentials: Codable {
     var selectedAccountID: UUID?
@@ -556,6 +698,8 @@ struct WindowChromeConfigurator: NSViewRepresentable {
 
     private func configure(_ window: NSWindow?) {
         guard let window else { return }
+        ApplicationKeyboardShortcutInterceptor.install()
+        KeyboardCommandRouter.shared.installMenuItem()
         window.styleMask.insert(.fullSizeContentView)
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
@@ -1677,6 +1821,11 @@ struct ContentView: View {
         case ready
     }
 
+    private enum DownloadSelectionScope {
+        case appGroups
+        case versions
+    }
+
     private enum ActiveField: Hashable {
         case search
         case manualAppID
@@ -1699,6 +1848,7 @@ struct ContentView: View {
     @State private var selectedAppLocalIconPath: String?
     @State private var selectedVersion: VersionRecord?
     @State private var selectedVersionIDs: Set<String> = []
+    @State private var lastSelectedVersionID: String?
     @State private var downloadedFiles: [String: URL] = [:]
     @State private var versionIcons: [String: NSImage] = [:]
     @State private var remoteAppIcons: [String: NSImage] = [:]
@@ -1706,7 +1856,12 @@ struct ContentView: View {
     @State private var downloadedItems: [DownloadedItem] = []
     @State private var noUpdateSelections: [String: Bool] = [:]
     @State private var selectedDownloadedItemID: String?
+    @State private var selectedDownloadedItemIDs: Set<String> = []
+    @State private var lastSelectedDownloadedItemID: String?
     @State private var selectedDownloadedGroupID: String?
+    @State private var selectedDownloadedGroupIDs: Set<String> = []
+    @State private var lastSelectedDownloadedGroupID: String?
+    @State private var downloadSelectionScope: DownloadSelectionScope = .appGroups
     @State private var downloadSearchQuery = ""
     @State private var expandedGroups: Set<String> = []
     @State private var manualAppID = ""
@@ -1773,10 +1928,37 @@ struct ContentView: View {
             }
             .toolbar(removing: .title)
         .background(appBackground)
+        .background(
+            FocusReleaseClickMonitor(
+                isEditing: Binding(
+                    get: { activeField != nil },
+                    set: { editing in
+                        if !editing {
+                            activeField = nil
+                            KeyboardShortcutState.shared.isTextEditing = false
+                        }
+                    }
+                )
+            )
+            .frame(width: 0, height: 0)
+        )
         .background(WindowChromeConfigurator())
         .frame(minWidth: 1100, minHeight: 680)
         .onAppear(perform: loadSavedValuesOnce)
         .onAppear { refreshDownloadedFiles() }
+        .onAppear {
+            ApplicationKeyboardShortcutInterceptor.install()
+            KeyboardShortcutState.shared.isTextEditing = activeField != nil
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .pastelSelectAllRows)) { _ in
+            handleSelectAllShortcut()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .pastelRefreshActivePanel)) { _ in
+            handleRefreshShortcut()
+        }
+        .onChange(of: activeField) { _, field in
+            KeyboardShortcutState.shared.isTextEditing = field != nil
+        }
         .onChange(of: accountStore.selectedAccountID) { _, _ in
             let country = accountStore.selectedAccount?.countryCode ?? selectedCountryCode
             storefrontReloadTask?.cancel()
@@ -1804,6 +1986,9 @@ struct ContentView: View {
             refreshDownloadedFiles()
             let validIDs = Set(results.map(\.id))
             selectedVersionIDs.formIntersection(validIDs)
+            if let lastSelectedVersionID, !validIDs.contains(lastSelectedVersionID) {
+                self.lastSelectedVersionID = nil
+            }
             if let selectedVersion, !validIDs.contains(selectedVersion.id) {
                 self.selectedVersion = nil
                 downloadVersionID = ""
@@ -2049,15 +2234,11 @@ struct ContentView: View {
 
     private var manualDownloadedURL: URL? {
         guard !manualVersionIDTrimmed.isEmpty else { return nil }
-        if let item = downloadedItems.first(where: { item in
+        return downloadedItems.first(where: { item in
             item.versionId == manualVersionIDTrimmed
                 && item.removesAppStoreUpdates == manualDownloadVariant.removesAppStoreUpdates
                 && (manualAppIDTrimmed.isEmpty || item.appId == manualAppIDTrimmed)
-        }) {
-            return item.fileURL
-        }
-        return downloadedVersionIDs[downloadedFileKey(manualVersionIDTrimmed, variant: manualDownloadVariant)]
-            ?? downloadedFiles[downloadedFileKey(manualVersionIDTrimmed, variant: manualDownloadVariant)]
+        })?.fileURL
     }
 
     private var manualActionState: ManualActionState {
@@ -2093,7 +2274,7 @@ struct ContentView: View {
             .padding(.top, 12)
             .padding(.leading, 14)
             .padding(.trailing, 14)
-            .padding(.bottom, 12)
+            .padding(.bottom, rightPanel == .download ? 0 : 12)
         }
         .navigationSplitViewStyle(.balanced)
         .toolbar(removing: .sidebarToggle)
@@ -2109,7 +2290,7 @@ struct ContentView: View {
                 .padding(.top, 12)
                 .padding(.leading, 14)
                 .padding(.trailing, 14)
-                .padding(.bottom, 12)
+                .padding(.bottom, 4)
         }
         .navigationSplitViewStyle(.balanced)
         .toolbar(removing: .sidebarToggle)
@@ -2372,8 +2553,9 @@ struct ContentView: View {
             .padding(10)
             .frame(maxHeight: .infinity, alignment: .top)
         } else {
-            VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: 0) {
                 appHistoryHeader
+                    .padding(.bottom, 10)
                     .zIndex(1)
 
                 Group {
@@ -2417,74 +2599,77 @@ struct ContentView: View {
                         }
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                     } else {
-                        ScrollView {
-                            LazyVStack(alignment: .leading, spacing: 4) {
-                                ForEach(Array(catalog.versionResults.enumerated()), id: \.element.id) { index, record in
-                                    let removesUpdates = noUpdateEnabled(for: record)
-                                    let jobID = downloadJobID(for: record, removesAppStoreUpdates: removesUpdates)
-                                    let downloadedURL = downloadedFileFor(record, removesAppStoreUpdates: removesUpdates)
-                                    VersionSelectionRow(
-                                        record: record,
-                                        rowIndex: index,
-                                        isSelected: selectedVersionIDs.contains(record.id),
-                                        removesAppStoreUpdates: removesUpdates,
-                                        isDownloading: downloads.isRunning(jobID),
-                                        downloadProgress: downloads.job(jobID)?.progress,
-                                        isPackaging: downloads.job(jobID)?.isPackaging ?? false,
-                                        hasError: downloads.job(jobID)?.status == .failed,
-                                        errorLog: downloads.job(jobID)?.log ?? "",
-                                        downloadedURL: downloadedURL,
-                                        appIcon: downloadedURL.flatMap { versionIcons[$0.path] },
-                                        onSelect: {
-                                            handleVersionRowSelection(record)
-                                        },
-                                        onToggleNoUpdate: { enabled in
-                                            setNoUpdateEnabled(enabled, for: record)
-                                        },
-                                        onDownload: {
-                                            downloadVersion(record)
-                                        },
-                                        onReveal: {
-                                            if let url = downloadedFileFor(record, removesAppStoreUpdates: noUpdateEnabled(for: record)) { revealInFinder(url) }
-                                        },
-                                        onAirDrop: {
-                                            if let url = downloadedFileFor(record, removesAppStoreUpdates: noUpdateEnabled(for: record)) { airDrop(url) }
-                                        },
-                                        onDelete: {
-                                            if let url = downloadedFileFor(record, removesAppStoreUpdates: noUpdateEnabled(for: record)) { deleteDownloaded(url) }
-                                        }
-                                    )
-                                    .contextMenu {
-                                        if showsBatchDownloadMenu(for: record) {
-                                            Button(String(localized: "全部下载")) {
-                                                downloadSelectedVersions()
+                        VStack(spacing: 0) {
+                            ScrollView {
+                                LazyVStack(alignment: .leading, spacing: 4) {
+                                    ForEach(Array(catalog.versionResults.enumerated()), id: \.element.id) { index, record in
+                                        let removesUpdates = noUpdateEnabled(for: record)
+                                        let jobID = downloadJobID(for: record, removesAppStoreUpdates: removesUpdates)
+                                        let downloadedURL = downloadedFileFor(record, removesAppStoreUpdates: removesUpdates)
+                                        VersionSelectionRow(
+                                            record: record,
+                                            rowIndex: index,
+                                            isSelected: selectedVersionIDs.contains(record.id),
+                                            removesAppStoreUpdates: removesUpdates,
+                                            isDownloading: downloads.isRunning(jobID),
+                                            downloadProgress: downloads.job(jobID)?.progress,
+                                            isPackaging: downloads.job(jobID)?.isPackaging ?? false,
+                                            hasError: downloads.job(jobID)?.status == .failed,
+                                            errorLog: downloads.job(jobID)?.log ?? "",
+                                            downloadedURL: downloadedURL,
+                                            appIcon: downloadedURL.flatMap { versionIcons[$0.path] },
+                                            onSelect: {
+                                                handleVersionRowSelection(record)
+                                            },
+                                            onToggleNoUpdate: { enabled in
+                                                setNoUpdateEnabled(enabled, for: record)
+                                            },
+                                            onDownload: {
+                                                downloadVersion(record)
+                                            },
+                                            onReveal: {
+                                                if let url = downloadedFileFor(record, removesAppStoreUpdates: noUpdateEnabled(for: record)) { revealInFinder(url) }
+                                            },
+                                            onAirDrop: {
+                                                if let url = downloadedFileFor(record, removesAppStoreUpdates: noUpdateEnabled(for: record)) { airDrop(url) }
+                                            },
+                                            onDelete: {
+                                                if let url = downloadedFileFor(record, removesAppStoreUpdates: noUpdateEnabled(for: record)) { deleteDownloaded(url) }
                                             }
-                                        } else {
-                                            Button(String(localized: "拷贝版本 ID")) {
-                                                NSPasteboard.general.clearContents()
-                                                NSPasteboard.general.setString(record.versionId, forType: .string)
+                                        )
+                                        .contextMenu {
+                                            if showsBatchDownloadMenu(for: record) {
+                                                Button(String(localized: "全部下载")) {
+                                                    downloadSelectedVersions()
+                                                }
+                                            } else {
+                                                Button(String(localized: "拷贝版本 ID")) {
+                                                    NSPasteboard.general.clearContents()
+                                                    NSPasteboard.general.setString(record.versionId, forType: .string)
+                                                }
                                             }
                                         }
                                     }
                                 }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.top, 4)
+                                .padding(.bottom, 18)
                             }
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.top, 4)
-                            .padding(.bottom, 18)
-                        }
-                        .safeAreaBar(edge: .top, spacing: 4) {
-                            versionsHeaderBar
-                        }
-                        .safeAreaBar(edge: .bottom, spacing: 0) {
+                            .safeAreaBar(edge: .top, spacing: 4) {
+                                versionsHeaderBar
+                            }
+                            .contentMargins(.bottom, 6, for: .scrollContent)
+                            .contentMargins(.trailing, 0, for: .scrollIndicators)
+
                             versionsFooterBar
                         }
-                        .contentMargins(.bottom, 14, for: .scrollContent)
-                        .contentMargins(.trailing, 0, for: .scrollIndicators)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
 
                 historyMetadataBar
+                    .padding(.top, catalog.versionResults.isEmpty ? 10 : 0)
             }
             .padding(10)
             .frame(maxHeight: .infinity, alignment: .top)
@@ -2499,7 +2684,7 @@ struct ContentView: View {
                 340,
                 proxy.size.width - VersionSelectionRow.rowHorizontalPadding * 2 - alignedControlsWidth - 14
             )
-            let leadingWidth = min(availableLeadingWidth, 760)
+            let leadingWidth = min(availableLeadingWidth, 560)
 
             HStack(alignment: .center, spacing: 0) {
                 HStack(alignment: .center, spacing: 10) {
@@ -2542,15 +2727,15 @@ struct ContentView: View {
                 .frame(width: alignedControlsWidth, alignment: .trailing)
             }
             .padding(.horizontal, VersionSelectionRow.rowHorizontalPadding)
-            .padding(.vertical, 10)
-            .frame(width: proxy.size.width, height: 58, alignment: .leading)
+            .padding(.vertical, 6)
+            .frame(width: proxy.size.width, height: 48, alignment: .leading)
             .background(manualVersionBarFill, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
             .overlay {
                 RoundedRectangle(cornerRadius: 16, style: .continuous)
                     .stroke(Color(nsColor: .separatorColor).opacity(0.12), lineWidth: 1)
             }
         }
-        .frame(maxWidth: .infinity, minHeight: 58, maxHeight: 58, alignment: .leading)
+        .frame(maxWidth: .infinity, minHeight: 48, maxHeight: 48, alignment: .leading)
     }
 
     private func manualMetadataTextField(_ prompt: String, text: Binding<String>, field: ActiveField) -> some View {
@@ -3053,6 +3238,10 @@ struct ContentView: View {
         return filteredDownloadedAppGroups.first
     }
 
+    private func firstSelectedDownloadedGroupID() -> String? {
+        filteredDownloadedAppGroups.first { selectedDownloadedGroupIDs.contains($0.id) }?.id
+    }
+
     private var downloadLibrarySidebar: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
@@ -3065,17 +3254,26 @@ struct ContentView: View {
                     LazyVStack(spacing: 4) {
                         ForEach(filteredDownloadedAppGroups) { group in
                             Button {
-                                selectedDownloadedGroupID = group.id
-                                selectedDownloadedItemID = group.items.first?.id
+                                handleDownloadedGroupSelection(group)
                             } label: {
                                 DownloadedAppSidebarRow(
                                     group: group,
                                     icon: versionIcons[group.iconPath],
-                                    isSelected: selectedDownloadedGroup?.id == group.id
+                                    isSelected: selectedDownloadedGroupIDs.contains(group.id)
                                 )
                             }
                             .buttonStyle(StablePressButtonStyle())
                             .contextMenu {
+                                Button(String(localized: "删除"), role: .destructive) {
+                                    if showsBatchDeleteMenu(for: group) {
+                                        deleteSelectedDownloadedGroups()
+                                    } else {
+                                        deleteDownloadedGroup(group)
+                                    }
+                                }
+
+                                Divider()
+
                                 Button(String(localized: "在搜索中查看")) {
                                     openDownloadedGroupInSearch(group)
                                 }
@@ -3157,33 +3355,49 @@ struct ContentView: View {
                 downloadedGroupHeader(group)
                     .zIndex(1)
 
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 4) {
-                        ForEach(Array(group.items.enumerated()), id: \.element.id) { index, item in
-                            DownloadedVersionHistoryRow(
-                                item: item,
-                                icon: versionIcons[item.id],
-                                rowIndex: index,
-                                isSelected: false,
-                                onSelect: {},
-                                onReveal: { revealInFinder(item.fileURL) },
-                                onAirDrop: { airDrop(item.fileURL) },
-                                onDelete: { deleteDownloaded(item.fileURL) }
-                            )
+                ZStack(alignment: .bottom) {
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 4) {
+                            ForEach(Array(group.items.enumerated()), id: \.element.id) { index, item in
+                                DownloadedVersionHistoryRow(
+                                    item: item,
+                                    icon: versionIcons[item.id],
+                                    rowIndex: index,
+                                    isSelected: selectedDownloadedItemIDs.contains(item.id),
+                                    onSelect: {
+                                        handleDownloadedRowSelection(item)
+                                    },
+                                    onReveal: { revealInFinder(item.fileURL) },
+                                    onAirDrop: { airDrop(item.fileURL) },
+                                    onDelete: { deleteDownloaded(item.fileURL) }
+                                )
+                                .contextMenu {
+                                    if showsBatchDeleteMenu(for: item) {
+                                        Button(String(localized: "删除"), role: .destructive) {
+                                            deleteSelectedDownloadedItems()
+                                        }
+                                    } else {
+                                        Button(String(localized: "拷贝版本 ID")) {
+                                            NSPasteboard.general.clearContents()
+                                            NSPasteboard.general.setString(item.versionId, forType: .string)
+                                        }
+                                    }
+                                }
+                            }
                         }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.top, 4)
+                        .padding(.bottom, 18)
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.top, 4)
-                    .padding(.bottom, 18)
-                }
-                .safeAreaBar(edge: .top, spacing: 4) {
-                    downloadedVersionsHeaderBar
-                }
-                .safeAreaBar(edge: .bottom, spacing: 0) {
+                    .safeAreaBar(edge: .top, spacing: 4) {
+                        downloadedVersionsHeaderBar
+                    }
+                    .contentMargins(.bottom, 50, for: .scrollContent)
+                    .contentMargins(.trailing, 0, for: .scrollIndicators)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+
                     downloadedVersionsFooterBar(count: group.items.count)
                 }
-                .contentMargins(.bottom, 14, for: .scrollContent)
-                .contentMargins(.trailing, 0, for: .scrollIndicators)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 largeEmptyState(
@@ -3195,7 +3409,8 @@ struct ContentView: View {
                 )
             }
         }
-        .padding(10)
+        .padding(.horizontal, 10)
+        .padding(.top, 10)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
@@ -3235,15 +3450,14 @@ struct ContentView: View {
     }
 
     private func downloadedVersionListStatusBar(count: Int) -> some View {
-        HStack {
-            Spacer()
+        ZStack {
             Text(String(localized: "已下载 \(count) 个版本"))
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
-            Spacer()
         }
-        .frame(height: 30)
+        .frame(maxWidth: .infinity)
+        .frame(height: 32, alignment: .center)
         .background(.windowBackground)
     }
 
@@ -3900,15 +4114,14 @@ struct ContentView: View {
     }
 
     private var versionListStatusBar: some View {
-        HStack {
-            Spacer()
+        ZStack {
             Text(String(localized: "搜索到 \(catalog.versionResults.count) 个版本，来源 \(versionResultSourceSummary)"))
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
-            Spacer()
         }
-        .frame(height: 30)
+        .frame(maxWidth: .infinity)
+        .frame(height: 32, alignment: .center)
     }
 
     private var versionResultSourceSummary: String {
@@ -4102,6 +4315,7 @@ struct ContentView: View {
         catalog.historyAppID = downloadAppID.trimmingCharacters(in: .whitespacesAndNewlines)
         selectedVersion = nil
         selectedVersionIDs.removeAll()
+        lastSelectedVersionID = nil
         rightPanel = .search
         catalog.loadVersions()
     }
@@ -4111,6 +4325,7 @@ struct ContentView: View {
         selectedAppLocalIconPath = nil
         selectedVersion = nil
         selectedVersionIDs.removeAll()
+        lastSelectedVersionID = nil
         appleVersionFetchNeedsAcquisition = false
         downloadAppID = result.id
         downloadVersionID = ""
@@ -4130,6 +4345,7 @@ struct ContentView: View {
         if updateSelection {
             selectedVersionIDs = [record.id]
         }
+        lastSelectedVersionID = record.id
         selectedVersion = record
         downloadVersionID = record.versionId
         manualAppID = activeAppID
@@ -4138,24 +4354,35 @@ struct ContentView: View {
     }
 
     private func handleVersionRowSelection(_ record: VersionRecord) {
-        let commandPressed = NSEvent.modifierFlags
-            .intersection(.deviceIndependentFlagsMask)
-            .contains(.command)
+        activeField = nil
+        KeyboardShortcutState.shared.isTextEditing = false
+        let modifiers = NSEvent.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let commandPressed = modifiers.contains(.command)
+        let shiftPressed = modifiers.contains(.shift)
 
-        withAnimation(.smooth(duration: 0.18)) {
-            if commandPressed {
-                if selectedVersionIDs.contains(record.id) {
-                    selectedVersionIDs.remove(record.id)
-                    if selectedVersion?.id == record.id {
-                        selectFallbackVersionAfterDeselection()
-                    }
-                } else {
-                    selectedVersionIDs.insert(record.id)
-                    selectVersion(record, updateSelection: false)
+        if shiftPressed,
+           let anchorID = lastSelectedVersionID,
+           let anchorIndex = catalog.versionResults.firstIndex(where: { $0.id == anchorID }),
+           let targetIndex = catalog.versionResults.firstIndex(where: { $0.id == record.id }) {
+            let bounds = min(anchorIndex, targetIndex)...max(anchorIndex, targetIndex)
+            let rangeIDs = Set(catalog.versionResults[bounds].map(\.id))
+            selectedVersionIDs = commandPressed ? selectedVersionIDs.union(rangeIDs) : rangeIDs
+            selectVersion(record, updateSelection: false)
+            return
+        }
+
+        if commandPressed {
+            if selectedVersionIDs.contains(record.id) {
+                selectedVersionIDs.remove(record.id)
+                if selectedVersion?.id == record.id {
+                    selectFallbackVersionAfterDeselection()
                 }
             } else {
-                selectVersion(record)
+                selectedVersionIDs.insert(record.id)
+                selectVersion(record, updateSelection: false)
             }
+        } else {
+            selectVersion(record)
         }
     }
 
@@ -4164,6 +4391,7 @@ struct ContentView: View {
             selectedVersion = nil
             downloadVersionID = ""
             catalog.selectedVersionID = nil
+            lastSelectedVersionID = nil
             return
         }
         selectVersion(fallback, updateSelection: false)
@@ -4188,6 +4416,212 @@ struct ContentView: View {
 
     private func showsBatchDownloadMenu(for record: VersionRecord) -> Bool {
         selectedVersionIDs.count > 1 && selectedVersionIDs.contains(record.id)
+    }
+
+    private func handleSelectAllShortcut() {
+        switch rightPanel {
+        case .search, .versions:
+            selectAllVersionRows()
+        case .download:
+            switch downloadSelectionScope {
+            case .appGroups:
+                selectAllDownloadedGroupRows()
+            case .versions:
+                selectAllDownloadedRows()
+            }
+        case .logs:
+            break
+        }
+    }
+
+    private func handleRefreshShortcut() {
+        switch rightPanel {
+        case .download:
+            refreshDownloadedFiles()
+        case .search, .versions:
+            if !activeAppID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                loadHistoryForActiveApp()
+            } else if catalog.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                catalog.loadFeatured()
+            } else {
+                catalog.search()
+            }
+        case .logs:
+            break
+        }
+    }
+
+    private func selectAllVersionRows() {
+        guard !catalog.versionResults.isEmpty else { return }
+        selectedVersionIDs = Set(catalog.versionResults.map(\.id))
+        if let first = catalog.versionResults.first {
+            selectVersion(first, updateSelection: false)
+        }
+    }
+
+    private func selectAllDownloadedRows() {
+        guard let group = selectedDownloadedGroup, !group.items.isEmpty else { return }
+        downloadSelectionScope = .versions
+        selectedDownloadedItemIDs = Set(group.items.map(\.id))
+        selectedDownloadedItemID = group.items.first?.id
+        lastSelectedDownloadedItemID = selectedDownloadedItemID
+    }
+
+    private func selectAllDownloadedGroupRows() {
+        guard !filteredDownloadedAppGroups.isEmpty else { return }
+        downloadSelectionScope = .appGroups
+        selectedDownloadedGroupIDs = Set(filteredDownloadedAppGroups.map(\.id))
+        if let first = filteredDownloadedAppGroups.first {
+            selectedDownloadedGroupID = first.id
+            lastSelectedDownloadedGroupID = first.id
+        }
+        selectedDownloadedItemID = nil
+        selectedDownloadedItemIDs.removeAll()
+        lastSelectedDownloadedItemID = nil
+    }
+
+    private func handleDownloadedGroupSelection(_ group: DownloadedAppGroup) {
+        activeField = nil
+        KeyboardShortcutState.shared.isTextEditing = false
+        downloadSelectionScope = .appGroups
+        selectedDownloadedItemID = nil
+        selectedDownloadedItemIDs.removeAll()
+        lastSelectedDownloadedItemID = nil
+
+        let modifiers = NSEvent.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let commandPressed = modifiers.contains(.command)
+        let shiftPressed = modifiers.contains(.shift)
+
+        if shiftPressed,
+           let anchorID = lastSelectedDownloadedGroupID,
+           let anchorIndex = filteredDownloadedAppGroups.firstIndex(where: { $0.id == anchorID }),
+           let targetIndex = filteredDownloadedAppGroups.firstIndex(where: { $0.id == group.id }) {
+            let bounds = min(anchorIndex, targetIndex)...max(anchorIndex, targetIndex)
+            let rangeIDs = Set(filteredDownloadedAppGroups[bounds].map(\.id))
+            selectedDownloadedGroupIDs = commandPressed ? selectedDownloadedGroupIDs.union(rangeIDs) : rangeIDs
+            selectedDownloadedGroupID = group.id
+            return
+        }
+
+        if commandPressed {
+            if selectedDownloadedGroupIDs.contains(group.id) {
+                selectedDownloadedGroupIDs.remove(group.id)
+                if selectedDownloadedGroupID == group.id {
+                    selectedDownloadedGroupID = firstSelectedDownloadedGroupID()
+                }
+                if selectedDownloadedGroupIDs.isEmpty {
+                    selectedDownloadedGroupID = nil
+                    lastSelectedDownloadedGroupID = nil
+                }
+            } else {
+                selectedDownloadedGroupIDs.insert(group.id)
+                selectedDownloadedGroupID = group.id
+                lastSelectedDownloadedGroupID = group.id
+            }
+        } else {
+            selectedDownloadedGroupIDs = [group.id]
+            selectedDownloadedGroupID = group.id
+            lastSelectedDownloadedGroupID = group.id
+        }
+    }
+
+    private func handleDownloadedRowSelection(_ item: DownloadedItem) {
+        activeField = nil
+        KeyboardShortcutState.shared.isTextEditing = false
+        downloadSelectionScope = .versions
+        let modifiers = NSEvent.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let commandPressed = modifiers.contains(.command)
+        let shiftPressed = modifiers.contains(.shift)
+
+        if shiftPressed,
+           let anchorID = lastSelectedDownloadedItemID,
+           let items = selectedDownloadedGroup?.items,
+           let anchorIndex = items.firstIndex(where: { $0.id == anchorID }),
+           let targetIndex = items.firstIndex(where: { $0.id == item.id }) {
+            let bounds = min(anchorIndex, targetIndex)...max(anchorIndex, targetIndex)
+            let rangeIDs = Set(items[bounds].map(\.id))
+            selectedDownloadedItemIDs = commandPressed ? selectedDownloadedItemIDs.union(rangeIDs) : rangeIDs
+            selectedDownloadedItemID = item.id
+            return
+        }
+
+        if commandPressed {
+            if selectedDownloadedItemIDs.contains(item.id) {
+                selectedDownloadedItemIDs.remove(item.id)
+                if selectedDownloadedItemID == item.id {
+                    selectedDownloadedItemID = selectedDownloadedItemIDs.first
+                }
+            } else {
+                selectedDownloadedItemIDs.insert(item.id)
+                selectedDownloadedItemID = item.id
+                lastSelectedDownloadedItemID = item.id
+            }
+        } else {
+            selectedDownloadedItemIDs = [item.id]
+            selectedDownloadedItemID = item.id
+            lastSelectedDownloadedItemID = item.id
+        }
+    }
+
+    private func showsBatchDeleteMenu(for item: DownloadedItem) -> Bool {
+        selectedDownloadedItemIDs.count > 1 && selectedDownloadedItemIDs.contains(item.id)
+    }
+
+    private func showsBatchDeleteMenu(for group: DownloadedAppGroup) -> Bool {
+        selectedDownloadedGroupIDs.count > 1 && selectedDownloadedGroupIDs.contains(group.id)
+    }
+
+    private func deleteSelectedDownloadedItems() {
+        guard !selectedDownloadedItemIDs.isEmpty else { return }
+        let urls = downloadedItems
+            .filter { selectedDownloadedItemIDs.contains($0.id) }
+            .map(\.fileURL)
+
+        for url in urls {
+            try? FileManager.default.trashItem(at: url, resultingItemURL: nil)
+        }
+        selectedDownloadedItemIDs.removeAll()
+        selectedDownloadedItemID = nil
+        lastSelectedDownloadedItemID = nil
+        refreshDownloadedFiles()
+    }
+
+    private func deleteDownloadedGroup(_ group: DownloadedAppGroup) {
+        deleteDownloadedGroups(withIDs: [group.id])
+    }
+
+    private func deleteSelectedDownloadedGroups() {
+        guard !selectedDownloadedGroupIDs.isEmpty else { return }
+        deleteDownloadedGroups(withIDs: selectedDownloadedGroupIDs)
+    }
+
+    private func deleteDownloadedGroups(withIDs groupIDs: Set<String>) {
+        guard !groupIDs.isEmpty else { return }
+        let fallbackGroupID = filteredDownloadedAppGroups.first { !groupIDs.contains($0.id) }?.id
+        let urls = downloadedItems
+            .filter { groupIDs.contains($0.groupKey) }
+            .map(\.fileURL)
+
+        for url in urls {
+            try? FileManager.default.trashItem(at: url, resultingItemURL: nil)
+        }
+
+        selectedDownloadedGroupIDs.subtract(groupIDs)
+        if selectedDownloadedGroupIDs.isEmpty, let fallbackGroupID {
+            selectedDownloadedGroupIDs = [fallbackGroupID]
+            selectedDownloadedGroupID = fallbackGroupID
+            lastSelectedDownloadedGroupID = fallbackGroupID
+        } else if let selectedDownloadedGroupID, groupIDs.contains(selectedDownloadedGroupID) {
+            self.selectedDownloadedGroupID = firstSelectedDownloadedGroupID()
+        }
+        if let lastSelectedDownloadedGroupID, groupIDs.contains(lastSelectedDownloadedGroupID) {
+            self.lastSelectedDownloadedGroupID = firstSelectedDownloadedGroupID()
+        }
+        selectedDownloadedItemID = nil
+        selectedDownloadedItemIDs.removeAll()
+        lastSelectedDownloadedItemID = nil
+        downloadSelectionScope = .appGroups
+        refreshDownloadedFiles()
     }
 
     private static let versionIDsFetchJobKey = "__ipa_versionids_fetch__"
@@ -4234,6 +4668,7 @@ struct ContentView: View {
         guard !appID.isEmpty else { return }
         selectedVersion = nil
         selectedVersionIDs.removeAll()
+        lastSelectedVersionID = nil
         catalog.selectedVersionID = nil
         catalog.versionResults = []
         appleVersionFetchNeedsAcquisition = false
@@ -4258,6 +4693,7 @@ struct ContentView: View {
         guard !appID.isEmpty, !vid.isEmpty else { return }
         selectedVersion = nil
         selectedVersionIDs.removeAll()
+        lastSelectedVersionID = nil
         if selectedApp?.id != appID {
             selectedApp = nil
             selectedAppLocalIconPath = nil
@@ -4277,6 +4713,7 @@ struct ContentView: View {
               let ids = obj["versionIds"] as? [String] else {
             catalog.versionResults = []
             selectedVersionIDs.removeAll()
+            lastSelectedVersionID = nil
             if let errorLine = lines.last(where: { $0.contains("[X]") }) {
                 catalog.versionStatus = cleanDownloadErrorDetail(errorLine)
                     ?? String(localized: "未能从 Apple 获取版本，请改用其他来源。")
@@ -4288,6 +4725,7 @@ struct ContentView: View {
         if (obj["requiresAcquisition"] as? Bool) == true {
             catalog.versionResults = []
             selectedVersionIDs.removeAll()
+            lastSelectedVersionID = nil
             appleVersionFetchNeedsAcquisition = true
             catalog.versionStatus = String(localized: "此 Apple 账户未拥有此 App，是否从 Apple 获取此 App？")
             return
@@ -4297,6 +4735,7 @@ struct ContentView: View {
         }
         appleVersionFetchNeedsAcquisition = false
         selectedVersionIDs.removeAll()
+        lastSelectedVersionID = nil
         catalog.versionResults = records
         catalog.versionStatus = String(localized: "已从 Apple 元数据获取 \(records.count) 个版本 ID。")
     }
@@ -4347,13 +4786,23 @@ struct ContentView: View {
             let extracted = ipaURLs.compactMap { Self.extractDownloadedItem(fromIPA: $0) }
             DispatchQueue.main.async {
                 downloadedItems = extracted
+                let validDownloadedIDs = Set(extracted.map(\.id))
+                let validDownloadedGroupIDs = Set(extracted.map(\.groupKey))
+                selectedDownloadedItemIDs.formIntersection(validDownloadedIDs)
+                selectedDownloadedGroupIDs.formIntersection(validDownloadedGroupIDs)
                 if let selectedDownloadedItemID,
                    !extracted.contains(where: { $0.id == selectedDownloadedItemID }) {
                     self.selectedDownloadedItemID = nil
                 }
+                if let lastSelectedDownloadedGroupID,
+                   !validDownloadedGroupIDs.contains(lastSelectedDownloadedGroupID) {
+                    self.lastSelectedDownloadedGroupID = nil
+                }
                 if let selectedDownloadedGroupID,
-                   !Set(extracted.map(\.groupKey)).contains(selectedDownloadedGroupID) {
-                    self.selectedDownloadedGroupID = nil
+                   !validDownloadedGroupIDs.contains(selectedDownloadedGroupID) {
+                    self.selectedDownloadedGroupID = self.firstSelectedDownloadedGroupID()
+                    selectedDownloadedItemIDs.removeAll()
+                    lastSelectedDownloadedItemID = nil
                 }
             }
         }
@@ -4480,9 +4929,20 @@ struct ContentView: View {
     }
 
     private func downloadedFileFor(_ record: VersionRecord, removesAppStoreUpdates: Bool) -> URL? {
-        let variant = IPADownloadVariant(removeAppStoreUpdateMetadata: removesAppStoreUpdates)
-        return downloadedFiles[downloadedFileKey(record.version, variant: variant)]
-            ?? downloadedVersionIDs[downloadedFileKey(record.versionId, variant: variant)]
+        let appID = activeAppID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !appID.isEmpty else { return nil }
+        return downloadedItems.first { item in
+            guard item.appId == appID,
+                  item.removesAppStoreUpdates == removesAppStoreUpdates else {
+                return false
+            }
+
+            if !record.versionId.isEmpty {
+                return item.versionId == record.versionId
+            }
+
+            return !record.version.isEmpty && item.version == record.version
+        }?.fileURL
     }
 
     private static func runUnzip(_ args: [String]) -> Data? {
@@ -4542,6 +5002,10 @@ struct ContentView: View {
 
     private func deleteDownloaded(_ url: URL) {
         try? FileManager.default.trashItem(at: url, resultingItemURL: nil)
+        selectedDownloadedItemIDs = selectedDownloadedItemIDs.filter { $0 != url.path }
+        if selectedDownloadedItemID == url.path {
+            selectedDownloadedItemID = nil
+        }
         refreshDownloadedFiles()
     }
 
@@ -5016,7 +5480,6 @@ private struct DownloadedVersionHistoryRow: View {
                     .font(.callout.monospacedDigit())
                     .foregroundStyle(secondaryTextStyle)
                     .lineLimit(1)
-                    .textSelection(.enabled)
                     .frame(width: columns.versionID, alignment: .leading)
 
                 Text(item.sizeText)
@@ -5274,7 +5737,6 @@ struct VersionResultRow: View {
 
             Text(record.versionId)
                 .frame(width: 190, alignment: .leading)
-                .textSelection(.enabled)
                 .lineLimit(1)
 
             Text(record.size.isEmpty ? "-" : record.size)
@@ -5625,7 +6087,6 @@ struct VersionSelectionRow: View {
                     .frame(width: columns.versionID, alignment: .leading)
                     .foregroundStyle(secondaryTextStyle)
                     .lineLimit(1)
-                    .textSelection(.enabled)
 
                 Text(record.size.isEmpty ? "-" : record.size)
                     .font(.callout)
@@ -6645,6 +7106,7 @@ private struct AccountEditorInputRow: View {
     enum Kind {
         case text
         case secure
+        case code
     }
 
     let title: String
@@ -6661,27 +7123,31 @@ private struct AccountEditorInputRow: View {
                 .foregroundStyle(.primary)
                 .frame(width: 92, alignment: .leading)
 
-            input
-                .textFieldStyle(.plain)
-                .font(.body)
-                .overlay(alignment: .leading) {
-                    if text.isEmpty {
-                        Text(prompt)
-                            .font(.body)
-                            .foregroundStyle(Color(nsColor: .placeholderTextColor))
-                            .allowsHitTesting(false)
-                    }
+            ZStack(alignment: .leading) {
+                input
+                    .textFieldStyle(.plain)
+                    .font(.body)
+                    .lineLimit(1)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 22, alignment: .center)
+                    .focused($isFocused)
+
+                if text.isEmpty {
+                    Text(prompt)
+                        .font(.body)
+                        .foregroundStyle(Color(nsColor: .placeholderTextColor))
+                        .allowsHitTesting(false)
                 }
-                .padding(.horizontal, 10)
-                .frame(height: 32)
-                .frame(maxWidth: .infinity)
-                .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .stroke(isFocused ? Color.accentColor.opacity(0.65) : Color(nsColor: .separatorColor).opacity(0.28),
-                                lineWidth: isFocused ? 1.5 : 1)
-                }
-                .focused($isFocused)
+            }
+            .padding(.horizontal, 10)
+            .frame(height: 32)
+            .frame(maxWidth: .infinity)
+            .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(isFocused ? Color.accentColor.opacity(0.65) : Color(nsColor: .separatorColor).opacity(0.28),
+                            lineWidth: isFocused ? 1.5 : 1)
+            }
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 10)
@@ -6697,6 +7163,10 @@ private struct AccountEditorInputRow: View {
                 .onSubmit { onSubmit?() }
         case .secure:
             SecureField("", text: $text)
+                .onSubmit { onSubmit?() }
+        case .code:
+            TextField("", text: $text)
+                .textContentType(.oneTimeCode)
                 .onSubmit { onSubmit?() }
         }
     }
@@ -6768,7 +7238,7 @@ struct AccountEditorView: View {
                     VStack(spacing: 0) {
                         AccountEditorInputRow(title: String(localized: "验证码"),
                                               prompt: String(localized: "验证码"),
-                                              kind: .text,
+                                              kind: .code,
                                               text: $code,
                                               onSubmit: { accountStore.submitCode(code) })
                     }
@@ -7173,6 +7643,81 @@ private struct CheckForUpdatesSettingsRow: View {
     }
 }
 
+private struct FocusReleaseClickMonitor: NSViewRepresentable {
+    @Binding var isEditing: Bool
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(isEditing: $isEditing)
+    }
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView(frame: .zero)
+        context.coordinator.installIfNeeded()
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        context.coordinator.isEditing = $isEditing
+    }
+
+    static func dismantleNSView(_ nsView: NSView, coordinator: Coordinator) {
+        coordinator.uninstall()
+    }
+
+    final class Coordinator {
+        var isEditing: Binding<Bool>
+        private var monitor: Any?
+
+        init(isEditing: Binding<Bool>) {
+            self.isEditing = isEditing
+        }
+
+        func installIfNeeded() {
+            guard monitor == nil else { return }
+            monitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
+                self?.handle(event)
+                return event
+            }
+        }
+
+        func uninstall() {
+            if let monitor {
+                NSEvent.removeMonitor(monitor)
+            }
+            monitor = nil
+        }
+
+        private func handle(_ event: NSEvent) {
+            guard isEditing.wrappedValue, let window = event.window else { return }
+            guard let firstResponder = window.firstResponder as? NSTextView else { return }
+
+            if click(event, isInside: firstResponder, in: window) {
+                return
+            }
+
+            DispatchQueue.main.async {
+                self.isEditing.wrappedValue = false
+                if window.firstResponder === firstResponder {
+                    window.makeFirstResponder(nil)
+                }
+            }
+        }
+
+        private func click(_ event: NSEvent, isInside textView: NSTextView, in window: NSWindow) -> Bool {
+            guard let superview = textView.superview else { return false }
+            let fieldRect = superview.convert(textView.frame, to: nil).insetBy(dx: -10, dy: -10)
+            return fieldRect.contains(event.locationInWindow)
+        }
+    }
+}
+
+private final class KeyboardShortcutState {
+    static let shared = KeyboardShortcutState()
+    var isTextEditing = false
+
+    private init() {}
+}
+
 struct PastelSettingsCommands: Commands {
     @Environment(\.openWindow) private var openWindow
     let updateManager: AppUpdateManager
@@ -7185,6 +7730,13 @@ struct PastelSettingsCommands: Commands {
             .keyboardShortcut(",", modifiers: .command)
         }
 
+        CommandMenu(String(localized: "操作")) {
+            Button(String(localized: "刷新")) {
+                NotificationCenter.default.post(name: .pastelRefreshActivePanel, object: nil)
+            }
+            .keyboardShortcut("r", modifiers: .command)
+        }
+
         CommandGroup(after: .appInfo) {
             CheckForUpdatesMenuItem(updater: updateManager.updater)
         }
@@ -7195,6 +7747,10 @@ struct PastelSettingsCommands: Commands {
 struct PastelApp: App {
     @StateObject private var accountStore = AccountStore()
     @StateObject private var updateManager = AppUpdateManager()
+
+    init() {
+        ApplicationKeyboardShortcutInterceptor.install()
+    }
 
     var body: some Scene {
         Window(appDisplayName, id: "main") {
