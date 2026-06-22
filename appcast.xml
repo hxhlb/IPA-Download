@@ -4,9 +4,9 @@
         <title>Pastel</title>
         <item>
             <title>26.7</title>
-            <pubDate>Sun, 21 Jun 2026 20:40:37 +0800</pubDate>
-            <link>https://github.com/EEliberto/IPA-Download/releases/tag/Pastel8</link>
-            <sparkle:version>8</sparkle:version>
+            <pubDate>Mon, 22 Jun 2026 09:26:46 +0800</pubDate>
+            <link>https://github.com/EEliberto/IPA-Download/releases/tag/Pastel9</link>
+            <sparkle:version>9</sparkle:version>
             <sparkle:shortVersionString>26.7</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
             <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
@@ -136,7 +136,7 @@ Pastel 26.6 업데이트 내용:
 2. รองรับการเลือก App หลายเวอร์ชันเพื่อดาวน์โหลดหรือลบ
 3. เมื่อใช้ Apple เป็นแหล่งข้อมูล หากตรวจพบว่าเป็น App ที่ยังไม่เคยได้รับมาก่อน Pastel จะขอการยืนยันอีกครั้ง
 ]]></description>
-            <enclosure url="https://github.com/EEliberto/IPA-Download/releases/download/Pastel8/Pastel-26.7-build-8.dmg" length="46721326" type="application/octet-stream" sparkle:edSignature="3D904lqzghgjK/D30YcPTHoAjVWbSqtAJKgHXbCG0krAvTyzjPgozsMvXMBJ7DdSz6pOTkYEU70B4LruQ1cvBQ=="/>
+            <enclosure url="https://github.com/EEliberto/IPA-Download/releases/download/Pastel9/Pastel-26.7-build-9.dmg" length="51395304" type="application/octet-stream" sparkle:edSignature="5Zn1/qMTEDl+8k64pJxpq0FrrDGHyW50Xg+XP/tf5kwElcfBmapuM6YAnFoa1tDGCvb/v9TvhSWRESTcp8xECQ=="/>
         </item>
         <item>
             <title>26.6.1</title>

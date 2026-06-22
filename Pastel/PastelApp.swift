@@ -714,6 +714,75 @@ struct WindowChromeConfigurator: NSViewRepresentable {
     }
 }
 
+private struct GlassEffectDisplayInvalidator: NSViewRepresentable {
+    let trigger: Int
+
+    func makeNSView(context: Context) -> NSView {
+        NSView(frame: .zero)
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        scheduleRefresh(from: nsView)
+    }
+
+    private func scheduleRefresh(from nsView: NSView) {
+        DispatchQueue.main.async {
+            refresh(from: nsView)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) {
+            refresh(from: nsView)
+        }
+    }
+
+    private func refresh(from nsView: NSView) {
+        guard let contentView = nsView.window?.contentView else { return }
+        contentView.needsLayout = true
+        contentView.layoutSubtreeIfNeeded()
+        refreshScrollEdgeState(in: contentView)
+        contentView.needsDisplay = true
+        contentView.setNeedsDisplay(contentView.bounds)
+        contentView.displayIfNeeded()
+    }
+
+    private func refreshScrollEdgeState(in view: NSView) {
+        if let scrollView = view as? NSScrollView {
+            nudgeScrollEdgeState(for: scrollView)
+        }
+
+        for subview in view.subviews {
+            refreshScrollEdgeState(in: subview)
+        }
+    }
+
+    private func nudgeScrollEdgeState(for scrollView: NSScrollView) {
+        guard let documentView = scrollView.documentView else { return }
+
+        let clipView = scrollView.contentView
+        let originalOrigin = clipView.bounds.origin
+        let maxY = max(0, documentView.bounds.height - clipView.bounds.height)
+        guard maxY > 0 else { return }
+
+        let delta: CGFloat
+        if originalOrigin.y < maxY {
+            delta = min(0.75, maxY - originalOrigin.y)
+        } else {
+            delta = -min(0.75, originalOrigin.y)
+        }
+
+        guard delta != 0 else { return }
+
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0
+            context.allowsImplicitAnimation = false
+
+            clipView.scroll(to: NSPoint(x: originalOrigin.x, y: originalOrigin.y + delta))
+            scrollView.reflectScrolledClipView(clipView)
+            clipView.scroll(to: originalOrigin)
+            scrollView.reflectScrolledClipView(clipView)
+        }
+    }
+}
+
 struct SettingsWindowConfigurator: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView {
         let view = NSView()
@@ -1902,6 +1971,7 @@ struct ContentView: View {
     @StateObject private var catalog = CatalogViewModel()
 
     @State private var rightPanel = RightPanelMode.search
+    @State private var glassRefreshToken = 0
     @State private var pendingVerificationCode = ""
     @State private var showingVerificationPrompt = false
     @State private var pendingCodeJobID: String?
@@ -2010,6 +2080,7 @@ struct ContentView: View {
             .frame(width: 0, height: 0)
         )
         .background(WindowChromeConfigurator())
+        .background(GlassEffectDisplayInvalidator(trigger: glassRefreshToken))
         .frame(minWidth: 1100, minHeight: 680)
         .onAppear(perform: loadSavedValuesOnce)
         .onAppear { refreshDownloadedFiles() }
@@ -2062,7 +2133,11 @@ struct ContentView: View {
                 catalog.selectedVersionID = nil
             }
         }
-        .onChange(of: rightPanel) { _, panel in if panel == .download { refreshDownloadedFiles() } }
+        .onChange(of: rightPanel) { _, panel in
+            activeField = nil
+            if panel == .download { refreshDownloadedFiles() }
+            refreshGlassEffectDisplay()
+        }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             refreshDownloadedFiles()
         }
@@ -2326,6 +2401,16 @@ struct ContentView: View {
         selectedAppLocalIconPath.flatMap { versionIcons[$0] }
     }
 
+    private func refreshGlassEffectDisplay() {
+        glassRefreshToken &+= 1
+        DispatchQueue.main.async {
+            glassRefreshToken &+= 1
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.16) {
+            glassRefreshToken &+= 1
+        }
+    }
+
     private var libraryWorkspace: some View {
         NavigationSplitView {
             Group {
@@ -2505,13 +2590,14 @@ struct ContentView: View {
             .padding(.horizontal, 18)
             .padding(.bottom, 34)
         }
-        .safeAreaBar(edge: .top, spacing: 8) {
+        .safeAreaBar(edge: .top, spacing: 4) {
             sidebarSearchPanel
-            .padding(.horizontal, 18)
+                .padding(.horizontal, 18)
+                .padding(.top, 8)
+                .padding(.bottom, 8)
         }
         .scrollEdgeEffectStyle(.soft, for: .top)
         .contentMargins(.trailing, 0, for: .scrollIndicators)
-        .frame(maxHeight: .infinity, alignment: .top)
     }
 
     private var sidebarScrollMask: some View {
@@ -2523,9 +2609,11 @@ struct ContentView: View {
     }
 
     private var sidebarSearchPanel: some View {
-        VStack(spacing: 10) {
-            sidebarSearchControls
-            sidebarPlatformPicker
+        GlassEffectContainer(spacing: 10) {
+            VStack(spacing: 10) {
+                sidebarSearchControls
+                sidebarPlatformPicker
+            }
         }
         .frame(maxWidth: .infinity)
     }
@@ -2600,7 +2688,7 @@ struct ContentView: View {
                             .font(.callout)
                             .lineLimit(1)
                     }
-                    .frame(minWidth: 84, minHeight: 30)
+                    .frame(maxWidth: .infinity, minHeight: 30)
                     .padding(.horizontal, 10)
                     .foregroundStyle(isSelected ? Color.white : Color.secondary)
                     .background {
@@ -2623,15 +2711,14 @@ struct ContentView: View {
             }
         }
         .padding(3)
-        .frame(height: 36)
-        .fixedSize(horizontal: true, vertical: false)
+        .frame(maxWidth: .infinity, minHeight: 36, maxHeight: 36)
         .glassEffect(.regular.tint(searchControlGlassTint).interactive(), in: Capsule())
         .background(searchControlFill, in: Capsule())
         .overlay {
             Capsule()
                 .stroke(Color(nsColor: .separatorColor).opacity(0.16), lineWidth: 1)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(maxWidth: .infinity)
     }
 
     private var sidebarCountryMenu: some View {
@@ -3445,13 +3532,14 @@ struct ContentView: View {
             .padding(.horizontal, 18)
             .padding(.bottom, 34)
         }
-        .safeAreaBar(edge: .top, spacing: 8) {
-            downloadSidebarSearchControls
+        .safeAreaBar(edge: .top, spacing: 4) {
+            downloadSidebarSearchPanel
                 .padding(.horizontal, 18)
+                .padding(.top, 8)
+                .padding(.bottom, 8)
         }
         .scrollEdgeEffectStyle(.soft, for: .top)
         .contentMargins(.trailing, 0, for: .scrollIndicators)
-        .frame(maxHeight: .infinity, alignment: .top)
     }
 
     private var downloadSidebarHeader: some View {
@@ -3465,6 +3553,13 @@ struct ContentView: View {
         }
         .padding(.leading, 4)
         .padding(.trailing, 12)
+    }
+
+    private var downloadSidebarSearchPanel: some View {
+        GlassEffectContainer(spacing: 0) {
+            downloadSidebarSearchControls
+        }
+        .frame(maxWidth: .infinity)
     }
 
     private var downloadSidebarSearchControls: some View {
@@ -5571,19 +5666,24 @@ struct AppSidebarRow: View {
                     .font(.callout.weight(.semibold))
                     .foregroundStyle(isSelected ? Color.white : Color.primary)
                     .lineLimit(1)
-                Text(result.artistName)
-                    .font(.caption)
-                    .foregroundStyle(isSelected ? Color.white.opacity(0.78) : Color.secondary)
-                    .lineLimit(1)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
 
-            Text(result.fileSizeText)
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text(result.artistName)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+
+                    if !result.fileSizeText.isEmpty {
+                        Spacer(minLength: 8)
+                        Text(result.fileSizeText)
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
+                    }
+                }
                 .font(.caption)
                 .foregroundStyle(isSelected ? Color.white.opacity(0.78) : Color.secondary)
-                .lineLimit(1)
-                .fixedSize()
-                .frame(minWidth: 52, alignment: .trailing)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
         .padding(.horizontal, 10)
         .frame(height: 50)
@@ -5644,14 +5744,17 @@ private struct DownloadedAppSidebarRow: View {
                     .foregroundStyle(isSelected ? Color.white : Color.primary)
                     .lineLimit(1)
 
-                HStack(spacing: 5) {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
                     Text(group.developer.isEmpty ? group.bundleId : group.developer)
-                    Text("·")
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    Spacer(minLength: 8)
                     Text(String(localized: "\(group.items.count) 个版本"))
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
                 }
                 .font(.caption)
                 .foregroundStyle(isSelected ? Color.white.opacity(0.78) : Color.secondary)
-                .lineLimit(1)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
